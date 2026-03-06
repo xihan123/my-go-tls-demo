@@ -29,4 +29,4 @@ jobs:
       env:
         GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         MERGE_LABELS: ''
-        MERGE_FILTER_AUTHOR: 'xihan123'
+        MERGE_FILTER_AUTHOR: 'github-actions'
