@@ -29,6 +29,12 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildDate = "unknown"
+)
+
 const (
 	defaultAddr       = ":443"
 	shutdownTimeout   = 30 * time.Second
@@ -455,6 +461,13 @@ func signalChan() <-chan os.Signal {
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("my-go-tls-demo %s\n", Version)
+		fmt.Printf("Git commit: %s\n", GitCommit)
+		fmt.Printf("Build date: %s\n", BuildDate)
+		os.Exit(0)
+	}
+
 	_ = godotenv.Load()
 
 	cfg := Config{

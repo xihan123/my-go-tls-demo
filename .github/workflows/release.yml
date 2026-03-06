@@ -72,7 +72,22 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -ldflags="-s -w" -o my-go-tls-demo-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          GIT_COMMIT="$(git rev-parse HEAD)"
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          
+          OUTPUT="my-go-tls-demo-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            OUTPUT="${OUTPUT}.exe"
+          fi
+          
+          # 编译并注入版本信息
+          go build -ldflags="-s -w \
+            -X main.Version=${VERSION} \
+            -X main.GitCommit=${GIT_COMMIT} \
+            -X main.BuildDate=${BUILD_DATE}" \
+            -o "${OUTPUT}"
 
       - uses: actions/upload-artifact@v4
         with:
