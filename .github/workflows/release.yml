@@ -1,109 +1,24 @@
-name: Build and Release
+name: Release Please
 
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version number (e.g., v1.0.0)'
-        required: true
-        type: string
+    branches:
+    - main
 
 jobs:
-  create-tag:
-    if: github.event_name == 'workflow_dispatch'
+  release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Check Commit Message [skip CI]
+      env:
+        COMMIT_FILTER: "[skip ci]"
+      if: contains(github.event.head_commit.message, '[skip ci]')
+      run: |
+        echo "Commit contains '[skip ci]', skipping release"
+        exit 1
 
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Create and Push Tag
-        run: |
-          VERSION="${{ inputs.version }}"
-          # Ensure version starts with 'v'
-          if [[ ! "$VERSION" =~ ^v ]]; then
-            VERSION="v$VERSION"
-          fi
-          # Check if tag already exists
-          if git tag -l "$VERSION" | grep -q "$VERSION"; then
-            echo "Tag $VERSION already exists"
-            exit 1
-          fi
-          git tag "$VERSION"
-          git push origin "$VERSION"
-
-  build:
-    needs: [create-tag]
-    if: always() && (needs.create-tag.result == 'success' || github.event_name == 'push')
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-
-      - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          GIT_COMMIT="$(git rev-parse HEAD)"
-          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          
-          OUTPUT="my-go-tls-demo-${{ matrix.goos }}-${{ matrix.goarch }}"
-          
-          # 编译并注入版本信息
-          go build -ldflags="-s -w \
-            -X main.Version=${VERSION} \
-            -X main.GitCommit=${GIT_COMMIT} \
-            -X main.BuildDate=${BUILD_DATE}" \
-            -o "${OUTPUT}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: my-go-tls-demo-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: my-go-tls-demo-${{ matrix.goos }}-${{ matrix.goarch }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true
+    - uses: googleapis/release-please-action@v4
+      id: release
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        release-type: simple

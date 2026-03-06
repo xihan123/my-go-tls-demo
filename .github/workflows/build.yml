@@ -1,0 +1,199 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+    - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        type: string
+      draft:
+        description: 'Create as draft'
+        required: false
+        type: boolean
+        default: false
+      pre_release:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+        - target: windows-amd64
+          runner: windows-latest
+          artifact: my-go-tls-demo-windows-x64.exe
+          goos: windows
+          goarch: amd64
+          ext: .exe
+        - target: darwin-amd64
+          runner: macos-13
+          artifact: my-go-tls-demo-macos-x64
+          goos: darwin
+          goarch: amd64
+          ext: ''
+        - target: darwin-arm64
+          runner: macos-latest
+          artifact: my-go-tls-demo-macos-arm64
+          goos: darwin
+          goarch: arm64
+          ext: ''
+        - target: linux-amd64
+          runner: ubuntu-latest
+          artifact: my-go-tls-demo-linux-x64
+          goos: linux
+          goarch: amd64
+          ext: ''
+        - target: linux-arm64
+          runner: ubuntu-latest
+          artifact: my-go-tls-demo-linux-arm64
+          goos: linux
+          goarch: arm64
+          ext: ''
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+
+    - name: Get version info
+      id: version
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          VERSION="${{ inputs.version }}"
+        elif [ "${{ github.event_name }}" == "push" ]; then
+          VERSION="${GITHUB_REF#refs/tags/}"
+        else
+          VERSION="dev"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "git_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+    - name: Build binary
+      shell: bash
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        mkdir -p artifacts
+
+        go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }} -X main.GitCommit=${{ steps.version.outputs.git_commit }} -X main.BuildDate=${{ steps.version.outputs.build_date }}" -o "artifacts/${{ matrix.artifact }}" .
+
+        echo "Binary built: artifacts/${{ matrix.artifact }}"
+        ls -la artifacts/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact }}
+        path: artifacts/${{ matrix.artifact }}
+        retention-days: 90
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        pattern: my-go-tls-demo-*
+        merge-multiple: true
+
+    - name: Display structure of downloaded files
+      run: ls -laR artifacts
+      shell: bash
+
+    - name: Generate SHA256 checksums
+      run: |
+        cd artifacts
+        sha256sum * | sort > SHA256SUMS.txt
+        cat SHA256SUMS.txt
+      shell: bash
+
+    - name: Prepare release tag
+      id: tag
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+        elif [ "${{ github.event_name }}" == "push" ]; then
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        else
+          echo "tag=latest" >> $GITHUB_OUTPUT
+        fi
+      shell: bash
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        name: my-go-tls-demo ${{ steps.tag.outputs.tag }}
+        draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+        prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.pre_release || false }}
+        generate_release_notes: true
+        files: |
+          artifacts/*
+        body: |
+          ## my-go-tls-demo ${{ steps.tag.outputs.tag }}
+
+          ### Downloads
+
+          | Platform | Binary |
+          |----------|--------|
+          | Windows x64 | `my-go-tls-demo-windows-x64.exe` |
+          | macOS Intel | `my-go-tls-demo-macos-x64` |
+          | macOS ARM64 | `my-go-tls-demo-macos-arm64` |
+          | Linux x64 | `my-go-tls-demo-linux-x64` |
+          | Linux ARM64 | `my-go-tls-demo-linux-arm64` |
+
+          ### Verify Checksums
+
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+
+          ### Quick Start
+
+          **Windows:**
+          ```powershell
+          .\my-go-tls-demo-windows-x64.exe
+          ```
+
+          **macOS/Linux:**
+          ```bash
+          chmod +x my-go-tls-demo-*
+          ./my-go-tls-demo-*
+          ```
+
+          ### Version Info
+
+          Run with `--version` or `-v` to see build information:
+          ```bash
+          ./my-go-tls-demo-linux-x64 --version
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
