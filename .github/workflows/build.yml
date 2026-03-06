@@ -38,7 +38,7 @@ jobs:
           goarch: amd64
           ext: .exe
         - target: darwin-amd64
-          runner: macos-13
+          runner: ubuntu-latest
           artifact: my-go-tls-demo-macos-x64
           goos: darwin
           goarch: amd64
