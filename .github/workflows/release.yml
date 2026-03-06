@@ -78,9 +78,6 @@ jobs:
           BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           
           OUTPUT="my-go-tls-demo-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            OUTPUT="${OUTPUT}.exe"
-          fi
           
           # 编译并注入版本信息
           go build -ldflags="-s -w \
