@@ -5,9 +5,16 @@ on:
     branches:
     - main
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
     - name: Check Commit Message [skip CI]
       env:
@@ -22,3 +29,28 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         release-type: simple
+
+    - name: Output Release Info
+      if: ${{ steps.release.outputs.release_created }}
+      run: |
+        echo "Release created: ${{ steps.release.outputs.tag_name }}"
+        echo "Upload URL: ${{ steps.release.outputs.upload_url }}"
+
+  trigger-build:
+    needs: release-please
+    runs-on: ubuntu-latest
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    steps:
+    - name: Trigger Build Workflow
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'build.yml',
+            ref: 'main',
+            inputs: {
+              version: '${{ needs.release-please.outputs.tag_name }}'
+            }
+          })
