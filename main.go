@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -17,8 +18,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,16 +39,29 @@ var (
 )
 
 const (
-	defaultAddr       = ":443"
-	shutdownTimeout   = 30 * time.Second
+	defaultAddr = ":443"
+
+	shutdownTimeout = 30 * time.Second
+
 	readHeaderTimeout = 10 * time.Second
-	readTimeout       = 30 * time.Second
-	writeTimeout      = 30 * time.Second
-	idleTimeout       = 120 * time.Second
-	maxHeaderBytes    = 1 << 20
-	certOrganization  = "Self-Signed Certificate"
-	certValidYears    = 10
-	rsaKeyBits        = 4096
+
+	readTimeout = 30 * time.Second
+
+	writeTimeout = 30 * time.Second
+
+	idleTimeout = 120 * time.Second
+
+	maxHeaderBytes = 1 << 20
+
+	certOrganization = "Self-Signed Certificate"
+
+	certValidYears = 10
+
+	rsaKeyBits = 4096
+
+	defaultSpeedTestSize = 100 << 20
+
+	maxSpeedTestSize = 1 << 30
 )
 
 func generateSelfSignedCert(certPath, keyPath string) error {
@@ -160,20 +176,124 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+type SpeedTestManager struct {
+	downloadCnt atomic.Int64
+	totalBytes  atomic.Int64
+	whitelist   []*net.IPNet
+	allowAll    bool
+}
+
+func NewSpeedTestManager(whitelistStr string) *SpeedTestManager {
+	m := &SpeedTestManager{}
+	m.parseWhitelist(whitelistStr)
+	return m
+}
+
+func (m *SpeedTestManager) parseWhitelist(s string) {
+	if s == "" || s == "*" {
+		m.allowAll = true
+		return
+	}
+
+	for _, cidr := range strings.Split(s, ",") {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		// 如果不是 CIDR 格式，当作单个 IP 处理
+		if !strings.Contains(cidr, "/") {
+			if strings.Contains(cidr, ":") {
+				cidr += "/128"
+			} else {
+				cidr += "/32"
+			}
+		}
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("invalid whitelist entry: %s", cidr)
+			continue
+		}
+		m.whitelist = append(m.whitelist, ipNet)
+	}
+}
+
+func (m *SpeedTestManager) isAllowed(ipStr string) bool {
+	if m.allowAll {
+		return true
+	}
+
+	// 提取 IP（去掉端口）
+	host, _, err := net.SplitHostPort(ipStr)
+	if err != nil {
+		host = ipStr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	for _, ipNet := range m.whitelist {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *SpeedTestManager) recordDownload(bytes int64) {
+	m.downloadCnt.Add(1)
+	m.totalBytes.Add(bytes)
+}
+
+func (m *SpeedTestManager) getStats() (downloads, totalBytes int64) {
+	return m.downloadCnt.Load(), m.totalBytes.Load()
+}
+
+func parseSizeParam(s string) (int64, error) {
+	if s == "" {
+		return defaultSpeedTestSize, nil
+	}
+
+	s = strings.TrimSpace(strings.ToUpper(s))
+	var mult int64 = 1
+
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		mult = 1 << 30
+		s = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		mult = 1 << 20
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		mult = 1 << 10
+		s = strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size: %s", s)
+	}
+	return n * mult, nil
+}
+
 type Server struct {
-	httpServer  *http.Server
-	http3Server *http3.Server
-	tlsConfig   *tls.Config
-	certPath    string
-	keyPath     string
-	shutdownMu  sync.Mutex
-	shutdownCh  chan struct{}
+	httpServer   *http.Server
+	http3Server  *http3.Server
+	tlsConfig    *tls.Config
+	certPath     string
+	keyPath      string
+	shutdownMu   sync.Mutex
+	shutdownCh   chan struct{}
+	speedTestMgr *SpeedTestManager
 }
 
 type Config struct {
-	Addr     string
-	CertPath string
-	KeyPath  string
+	Addr           string
+	CertPath       string
+	KeyPath        string
+	SpeedWhitelist string
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -195,15 +315,15 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		certPath:   certPath,
-		keyPath:    keyPath,
-		shutdownCh: make(chan struct{}),
+		certPath:     certPath,
+		keyPath:      keyPath,
+		shutdownCh:   make(chan struct{}),
+		speedTestMgr: NewSpeedTestManager(cfg.SpeedWhitelist),
 	}
 
 	handler := s.createHandler()
 
-	// TCP TLS配置 - 只支持h2和http/1.1
-	tcpTLSConfig := &tls.Config{
+	tcpTLS := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		MaxVersion: tls.VersionTLS13,
 		CipherSuites: []uint16{
@@ -216,24 +336,19 @@ func NewServer(cfg Config) (*Server, error) {
 		GetCertificate:   s.getCertificate,
 	}
 
-	// HTTP/3 TLS配置 - 需要http3.ConfigureTLSConfig
-	quicTLSConfig := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		MaxVersion: tls.VersionTLS13,
-		CipherSuites: []uint16{
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_AES_128_GCM_SHA256,
-		},
+	quicTLS := &tls.Config{
+		MinVersion:       tls.VersionTLS13,
+		MaxVersion:       tls.VersionTLS13,
+		CipherSuites:     []uint16{tls.TLS_AES_256_GCM_SHA384, tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_AES_128_GCM_SHA256},
 		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 		GetCertificate:   s.getCertificate,
 	}
-	s.tlsConfig = http3.ConfigureTLSConfig(quicTLSConfig)
+	s.tlsConfig = http3.ConfigureTLSConfig(quicTLS)
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
-		TLSConfig:         tcpTLSConfig,
+		TLSConfig:         tcpTLS,
 		ReadTimeout:       readTimeout,
 		ReadHeaderTimeout: readHeaderTimeout,
 		WriteTimeout:      writeTimeout,
@@ -263,6 +378,8 @@ func (s *Server) getCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error
 func (s *Server) createHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.healthHandler)
+	mux.HandleFunc("/stats", s.statsHandler)
+	mux.HandleFunc("/download", s.speedTestHandler)
 	mux.HandleFunc("/", s.defaultHandler)
 
 	handler := s.securityMiddleware(mux)
@@ -303,6 +420,132 @@ func (s *Server) configureHTTP2(handler http.Handler) (http.Handler, error) {
 		MaxUploadBufferPerStream:     256 << 10,
 	}
 	return h2c.NewHandler(handler, h2s), nil
+}
+
+func (s *Server) speedTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.speedTestMgr.isAllowed(r.RemoteAddr) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	sizeStr := r.URL.Query().Get("size")
+	size, err := parseSizeParam(sizeStr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if size > maxSpeedTestSize {
+		http.Error(w, fmt.Sprintf("max size is %dGB", maxSpeedTestSize>>30), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=test%dMB.bin", size>>20))
+
+	http.ServeContent(&statsWriter{
+		ResponseWriter: w,
+		onDone:         func(n int64) { s.speedTestMgr.recordDownload(n) },
+	}, r, "test.bin", time.Now(), &virtualReader{size: size})
+}
+
+var patternBlock [64 << 10]byte
+
+func init() {
+	for i := range patternBlock {
+		patternBlock[i] = byte(i ^ (i >> 8) ^ (i >> 16))
+	}
+}
+
+type virtualReader struct {
+	size   int64
+	offset int64
+}
+
+func (v *virtualReader) Read(p []byte) (int, error) {
+	if v.offset >= v.size {
+		return 0, io.EOF
+	}
+
+	remain := v.size - v.offset
+	n := int64(len(p))
+	if n > remain {
+		n = remain
+	}
+
+	var written int64
+	for written < n {
+		off := (v.offset + written) % int64(len(patternBlock))
+		chunk := n - written
+		if chunk > int64(len(patternBlock))-off {
+			chunk = int64(len(patternBlock)) - off
+		}
+		copy(p[written:written+chunk], patternBlock[off:])
+		written += chunk
+	}
+
+	v.offset += n
+	return int(n), nil
+}
+
+func (v *virtualReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		v.offset = offset
+	case io.SeekCurrent:
+		v.offset += offset
+	case io.SeekEnd:
+		v.offset = v.size + offset
+	}
+	if v.offset < 0 {
+		v.offset = 0
+	}
+	if v.offset > v.size {
+		v.offset = v.size
+	}
+	return v.offset, nil
+}
+
+type statsWriter struct {
+	http.ResponseWriter
+	onDone func(int64)
+	n      int64
+}
+
+func (w *statsWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func (w *statsWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statsWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
+}
+
+func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	downloads, total := s.speedTestMgr.getStats()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"downloads":%d,"total_bytes":%d,"total_mb":%.2f}`, downloads, total, float64(total)/(1<<20))
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -471,9 +714,10 @@ func main() {
 	_ = godotenv.Load()
 
 	cfg := Config{
-		Addr:     getEnvWithDefault("SERVER_ADDR", defaultAddr),
-		CertPath: getEnvWithDefault("CERT_PATH", "./certs/server.crt"),
-		KeyPath:  getEnvWithDefault("KEY_PATH", "./certs/server.key"),
+		Addr:           getEnvWithDefault("SERVER_ADDR", defaultAddr),
+		CertPath:       getEnvWithDefault("CERT_PATH", "./certs/server.crt"),
+		KeyPath:        getEnvWithDefault("KEY_PATH", "./certs/server.key"),
+		SpeedWhitelist: getEnvWithDefault("SPEED_WHITELIST", "*"),
 	}
 
 	server, err := NewServer(cfg)
