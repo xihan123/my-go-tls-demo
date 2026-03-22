@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/xihan123/my-go-tls-demo/compare/v1.2.0...v1.3.0) (2026-03-22)
+
+
+### Features
+
+* **server:** 添加网络连接检测接口 ([250d69f](https://github.com/xihan123/my-go-tls-demo/commit/250d69f8e45d0a5b1ed6bd462f60ad0ecb75b5f2))
+
 ## [1.2.0](https://github.com/xihan123/my-go-tls-demo/compare/v1.1.0...v1.2.0) (2026-03-22)
 
 
