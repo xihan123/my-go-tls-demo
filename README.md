@@ -27,6 +27,7 @@ Self-signed certificates are auto-generated on first run.
 
 Control who can access `/download` endpoint:
 
+**Via environment variable:**
 ```bash
 # Allow all (default)
 SPEED_WHITELIST=*
@@ -39,9 +40,14 @@ SPEED_WHITELIST=192.168.1.100,10.0.0.50
 
 # CIDR ranges
 SPEED_WHITELIST=192.168.1.0/24,10.0.0.0/8
+```
 
-# Mixed
-SPEED_WHITELIST=127.0.0.1,192.168.1.0/24
+**Via command line:**
+
+```bash
+# Override environment variable
+./my-go-tls-demo -whitelist "192.168.1.0/24,10.0.0.50"
+./my-go-tls-demo -w "192.168.1.0/24"  # shorthand
 ```
 
 ## Endpoints

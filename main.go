@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -704,7 +705,16 @@ func signalChan() <-chan os.Signal {
 }
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+	var showVersion bool
+	var whitelist string
+
+	flag.BoolVar(&showVersion, "version", false, "show version info")
+	flag.BoolVar(&showVersion, "v", false, "show version info (shorthand)")
+	flag.StringVar(&whitelist, "whitelist", "", "speed test IP whitelist (comma-separated, overrides SPEED_WHITELIST)")
+	flag.StringVar(&whitelist, "w", "", "speed test IP whitelist (shorthand)")
+	flag.Parse()
+
+	if showVersion {
 		fmt.Printf("my-go-tls-demo %s\n", Version)
 		fmt.Printf("Git commit: %s\n", GitCommit)
 		fmt.Printf("Build date: %s\n", BuildDate)
@@ -713,11 +723,16 @@ func main() {
 
 	_ = godotenv.Load()
 
+	speedWhitelist := getEnvWithDefault("SPEED_WHITELIST", "*")
+	if whitelist != "" {
+		speedWhitelist = whitelist
+	}
+
 	cfg := Config{
 		Addr:           getEnvWithDefault("SERVER_ADDR", defaultAddr),
 		CertPath:       getEnvWithDefault("CERT_PATH", "./certs/server.crt"),
 		KeyPath:        getEnvWithDefault("KEY_PATH", "./certs/server.key"),
-		SpeedWhitelist: getEnvWithDefault("SPEED_WHITELIST", "*"),
+		SpeedWhitelist: speedWhitelist,
 	}
 
 	server, err := NewServer(cfg)
