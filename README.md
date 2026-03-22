@@ -56,6 +56,7 @@ SPEED_WHITELIST=192.168.1.0/24,10.0.0.0/8
 - `GET /health` - Health check
 - `GET /download` - Speed test file download (default 100MB)
 - `GET /stats` - Download statistics
+- `GET /generate_204` - Network connectivity check (returns HTTP 204)
 
 ## Speed Test
 
@@ -79,3 +80,14 @@ Features:
 - Zero disk/memory usage (virtual data source)
 - Range request support (multi-threaded download)
 - Automatic HTTP/2 and HTTP/3 support
+
+## Connectivity Check
+
+Similar to `https://www.gstatic.com/generate_204`, used for network connectivity detection:
+
+```bash
+# Returns HTTP 204 No Content if network is working
+curl -I https://localhost:443/generate_204
+```
+
+Commonly used by clients to detect captive portals or verify internet connectivity.

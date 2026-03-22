@@ -381,6 +381,7 @@ func (s *Server) createHandler() http.Handler {
 	mux.HandleFunc("/health", s.healthHandler)
 	mux.HandleFunc("/stats", s.statsHandler)
 	mux.HandleFunc("/download", s.speedTestHandler)
+	mux.HandleFunc("/generate_204", s.generate204Handler)
 	mux.HandleFunc("/", s.defaultHandler)
 
 	handler := s.securityMiddleware(mux)
@@ -562,6 +563,11 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"status":"healthy"}`)
 	}
+}
+
+func (s *Server) generate204Handler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) defaultHandler(w http.ResponseWriter, r *http.Request) {
