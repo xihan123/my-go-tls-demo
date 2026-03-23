@@ -40,33 +40,21 @@ var (
 )
 
 const (
-	defaultAddr = ":443"
-
-	shutdownTimeout = 30 * time.Second
-
-	readHeaderTimeout = 10 * time.Second
-
-	readTimeout = 30 * time.Second
-
-	writeTimeout = 30 * time.Second
-
-	idleTimeout = 120 * time.Second
-
-	maxHeaderBytes = 1 << 20
-
-	certOrganization = "Self-Signed Certificate"
-
-	certValidYears = 10
-
-	rsaKeyBits = 4096
-
+	defaultAddr          = ":443"
+	shutdownTimeout      = 30 * time.Second
+	readHeaderTimeout    = 10 * time.Second
+	readTimeout          = 30 * time.Second
+	writeTimeout         = 30 * time.Second
+	idleTimeout          = 120 * time.Second
+	maxHeaderBytes       = 1 << 20
+	certOrganization     = "Self-Signed Certificate"
+	certValidYears       = 10
+	rsaKeyBits           = 4096
 	defaultSpeedTestSize = 100 << 20
-
-	maxSpeedTestSize = 1 << 30
+	maxSpeedTestSize     = 1 << 30
 )
 
 func generateSelfSignedCert(certPath, keyPath string) error {
-	// 创建目录
 	certDir := filepath.Dir(certPath)
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		return fmt.Errorf("failed to create cert directory: %w", err)
@@ -238,7 +226,6 @@ func (m *SpeedTestManager) parseWhitelist(s string) {
 		if cidr == "" {
 			continue
 		}
-		// 如果不是 CIDR 格式，当作单个 IP 处理
 		if !strings.Contains(cidr, "/") {
 			if strings.Contains(cidr, ":") {
 				cidr += "/128"
@@ -260,7 +247,6 @@ func (m *SpeedTestManager) isAllowed(ipStr string) bool {
 		return true
 	}
 
-	// 提取 IP（去掉端口）
 	host, _, err := net.SplitHostPort(ipStr)
 	if err != nil {
 		host = ipStr
@@ -615,22 +601,20 @@ func (s *Server) generate204Handler(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) defaultHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	var tlsInfo struct {
-		Version     string
-		CipherSuite string
-	}
+	var tlsVersion, tlsCipher string
 	if tlsState := r.TLS; tlsState != nil {
-		tlsInfo.Version = tlsVersionName(tlsState.Version)
-		tlsInfo.CipherSuite = tlsCipherSuiteName(tlsState.CipherSuite)
+		tlsVersion = tlsVersionName(tlsState.Version)
+		tlsCipher = tlsCipherSuiteName(tlsState.CipherSuite)
 	} else {
-		tlsInfo.Version = "N/A"
-		tlsInfo.CipherSuite = "N/A"
+		tlsVersion = "-"
+		tlsCipher = "-"
 	}
 
-	hostname, err := os.Hostname()
-	if err != nil {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
 		hostname = "localhost"
 	}
+
 	proto := r.Proto
 	if r.ProtoMajor == 3 {
 		proto = "HTTP/3"
@@ -642,100 +626,60 @@ func (s *Server) defaultHandler(w http.ResponseWriter, r *http.Request) {
 	html := `<!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HTTPS Server</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #eee; min-height: 100vh; }
-        .container { max-width: 900px; margin: 0 auto; }
-        h1 { color: #4fc3f7; margin-bottom: 8px; font-size: 2em; }
-        .version { color: #888; font-size: 0.9em; margin-bottom: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-top: 20px; }
-        .card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 20px; backdrop-filter: blur(10px); }
-        .card h2 { color: #4fc3f7; font-size: 1.1em; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); }
-        table { width: 100%; border-collapse: collapse; }
-        td { padding: 6px 0; font-size: 0.9em; }
-        td:first-child { color: #888; width: 40%; }
-        td:last-child { word-break: break-all; }
-        .endpoints { list-style: none; }
-        .endpoints li { padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 12px; }
-        .endpoints li:last-child { border-bottom: none; }
-        .endpoints code { background: rgba(79,195,247,0.15); color: #4fc3f7; padding: 4px 10px; border-radius: 4px; font-size: 0.85em; white-space: nowrap; }
-        .endpoints a { color: #4fc3f7; text-decoration: none; }
-        .endpoints a:hover { text-decoration: underline; }
-        .method { font-size: 0.7em; padding: 2px 6px; border-radius: 3px; background: #2e7d32; color: #fff; }
-        .desc { color: #aaa; font-size: 0.85em; flex: 1; }
-        .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-        .stat-item { text-align: center; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; }
-        .stat-value { font-size: 1.5em; color: #4fc3f7; font-weight: 600; }
-        .stat-label { font-size: 0.75em; color: #888; margin-top: 4px; }
-        .headers-list { max-height: 200px; overflow-y: auto; }
-        .header-item { padding: 4px 0; font-size: 0.8em; }
-        .header-key { color: #81c784; }
-        .header-val { color: #aaa; word-break: break-all; }
-        footer { text-align: center; margin-top: 40px; color: #555; font-size: 0.8em; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HTTPS Server</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:14px/1.5 system-ui,sans-serif;background:#0a0a0a;color:#ccc;min-height:100vh;padding:24px 16px}
+.wrap{max-width:520px;margin:0 auto}
+h1{font-size:1.25em;color:#fff;margin-bottom:4px;font-weight:600}
+.tag{font-size:12px;color:#555;margin-bottom:20px}
+.card{background:#181818;border-radius:8px;padding:16px;margin-bottom:12px}
+.card h2{font-size:11px;color:#666;margin-bottom:12px;font-weight:500}
+.row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #252525}
+.row:last-child{border:none}
+.key{color:#666}
+.val{color:#ddd;text-align:right;word-break:break-all;max-width:65%}
+a{color:#5af;text-decoration:none}
+a:hover{text-decoration:underline}
+code{background:#252525;padding:2px 6px;border-radius:4px;font-size:13px;color:#5af}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>🔐 HTTPS Server</h1>
-        <p class="version">Version: ` + Version + ` | Build: ` + BuildDate + `</p>
-        
-        <div class="grid">
-            <div class="card">
-                <h2>📡 Connection</h2>
-                <table>
-                    <tr><td>Protocol</td><td>` + proto + `</td></tr>
-                    <tr><td>TLS Version</td><td>` + tlsInfo.Version + `</td></tr>
-                    <tr><td>Cipher Suite</td><td>` + tlsInfo.CipherSuite + `</td></tr>
-                    <tr><td>Server Host</td><td>` + hostname + `</td></tr>
-                    <tr><td>Your IP</td><td>` + realIP + `</td></tr>
-                    <tr><td>Remote Addr</td><td>` + r.RemoteAddr + `</td></tr>
-                    <tr><td>Server Time</td><td>` + time.Now().Format("2006-01-02 15:04:05 MST") + `</td></tr>
-                </table>
-            </div>
-            
-            <div class="card">
-                <h2>📊 Statistics</h2>
-                <div class="stats">
-                    <div class="stat-item">
-                        <div class="stat-value">` + fmt.Sprintf("%d", downloads) + `</div>
-                        <div class="stat-label">Downloads</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value">` + fmt.Sprintf("%.2f", float64(totalBytes)/(1<<20)) + `</div>
-                        <div class="stat-label">Total MB</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>🔗 Endpoints</h2>
-                <ul class="endpoints">
-                    <li><code><a href="/health">/health</a></code><span class="method">GET</span><span class="desc">Health check</span></li>
-                    <li><code><a href="/stats">/stats</a></code><span class="method">GET</span><span class="desc">Download statistics</span></li>
-                    <li><code><a href="/download">/download</a></code><span class="method">GET</span><span class="desc">Speed test (size param)</span></li>
-                    <li><code>/generate_204</code><span class="method">GET</span><span class="desc">Captive portal check</span></li>
-                </ul>
-            </div>
-            
-            <div class="card">
-                <h2>📋 Request Headers</h2>
-                <div class="headers-list">
-                    <div class="header-item"><span class="header-key">User-Agent:</span> <span class="header-val">` + r.UserAgent() + `</span></div>
-                    <div class="header-item"><span class="header-key">Accept:</span> <span class="header-val">` + r.Header.Get("Accept") + `</span></div>
-                    <div class="header-item"><span class="header-key">Accept-Language:</span> <span class="header-val">` + r.Header.Get("Accept-Language") + `</span></div>
-                    <div class="header-item"><span class="header-key">Accept-Encoding:</span> <span class="header-val">` + r.Header.Get("Accept-Encoding") + `</span></div>
-                    <div class="header-item"><span class="header-key">Connection:</span> <span class="header-val">` + r.Header.Get("Connection") + `</span></div>
-                </div>
-            </div>
-        </div>
-        
-        <footer>
-            Powered by Go | TLS 1.3 Only | HTTP/2 & HTTP/3
-        </footer>
-    </div>
+<div class="wrap">
+<h1>HTTPS Server</h1>
+<p class="tag">` + Version + `</p>
+
+<div class="card">
+<h2>Connection</h2>
+<div class="row"><span class="key">Protocol</span><span class="val">` + proto + `</span></div>
+<div class="row"><span class="key">TLS</span><span class="val">` + tlsVersion + `</span></div>
+<div class="row"><span class="key">Cipher</span><span class="val">` + tlsCipher + `</span></div>
+<div class="row"><span class="key">Host</span><span class="val">` + hostname + `</span></div>
+<div class="row"><span class="key">IP</span><span class="val">` + realIP + `</span></div>
+<div class="row"><span class="key">Time</span><span class="val">` + time.Now().Format("2006-01-02 15:04:05") + `</span></div>
+</div>
+
+<div class="card">
+<h2>Stats</h2>
+<div class="row"><span class="key">Downloads</span><span class="val">` + fmt.Sprintf("%d", downloads) + `</span></div>
+<div class="row"><span class="key">Total</span><span class="val">` + fmt.Sprintf("%.2f MB", float64(totalBytes)/(1<<20)) + `</span></div>
+</div>
+
+<div class="card">
+<h2>Endpoints</h2>
+<div class="row"><code><a href="/health">/health</a></code><span class="val">health check</span></div>
+<div class="row"><code><a href="/stats">/stats</a></code><span class="val">statistics</span></div>
+<div class="row"><code><a href="/download">/download</a></code><span class="val">speed test</span></div>
+<div class="row"><code>/generate_204</code><span class="val">captive portal</span></div>
+</div>
+
+<div class="card">
+<h2>Request</h2>
+<div class="row"><span class="key">User-Agent</span><span class="val">` + r.UserAgent() + `</span></div>
+</div>
+</div>
 </body>
 </html>`
 	_, _ = fmt.Fprint(w, html)
