@@ -586,7 +586,10 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	downloads, total := s.speedTestMgr.getStats()
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"downloads":%d,"total_bytes":%d,"total_mb":%.2f}`, downloads, total, float64(total)/(1<<20))
+	_, err := fmt.Fprintf(w, `{"downloads":%d,"total_bytes":%d,"total_mb":%.2f}`, downloads, total, float64(total)/(1<<20))
+	if err != nil {
+		return
+	}
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -604,7 +607,7 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) generate204Handler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) generate204Handler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -633,30 +636,106 @@ func (s *Server) defaultHandler(w http.ResponseWriter, r *http.Request) {
 		proto = "HTTP/3"
 	}
 
+	realIP := getRealIP(r)
+	downloads, totalBytes := s.speedTestMgr.getStats()
+
 	html := `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HTTPS Server</title>
     <style>
-        body { font-family: system-ui, sans-serif; padding: 40px; background: #1a1a2e; color: #eee; }
-        h1 { color: #4fc3f7; }
-        table { border-collapse: collapse; margin: 20px 0; }
-        td { padding: 8px 16px; border-bottom: 1px solid #333; }
-        td:first-child { color: #888; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #eee; min-height: 100vh; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #4fc3f7; margin-bottom: 8px; font-size: 2em; }
+        .version { color: #888; font-size: 0.9em; margin-bottom: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-top: 20px; }
+        .card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 20px; backdrop-filter: blur(10px); }
+        .card h2 { color: #4fc3f7; font-size: 1.1em; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        table { width: 100%; border-collapse: collapse; }
+        td { padding: 6px 0; font-size: 0.9em; }
+        td:first-child { color: #888; width: 40%; }
+        td:last-child { word-break: break-all; }
+        .endpoints { list-style: none; }
+        .endpoints li { padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 12px; }
+        .endpoints li:last-child { border-bottom: none; }
+        .endpoints code { background: rgba(79,195,247,0.15); color: #4fc3f7; padding: 4px 10px; border-radius: 4px; font-size: 0.85em; white-space: nowrap; }
+        .endpoints a { color: #4fc3f7; text-decoration: none; }
+        .endpoints a:hover { text-decoration: underline; }
+        .method { font-size: 0.7em; padding: 2px 6px; border-radius: 3px; background: #2e7d32; color: #fff; }
+        .desc { color: #aaa; font-size: 0.85em; flex: 1; }
+        .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+        .stat-item { text-align: center; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+        .stat-value { font-size: 1.5em; color: #4fc3f7; font-weight: 600; }
+        .stat-label { font-size: 0.75em; color: #888; margin-top: 4px; }
+        .headers-list { max-height: 200px; overflow-y: auto; }
+        .header-item { padding: 4px 0; font-size: 0.8em; }
+        .header-key { color: #81c784; }
+        .header-val { color: #aaa; word-break: break-all; }
+        footer { text-align: center; margin-top: 40px; color: #555; font-size: 0.8em; }
     </style>
 </head>
 <body>
-    <h1>HTTPS Server</h1>
-    <table>
-        <tr><td>Protocol</td><td>` + proto + `</td></tr>
-        <tr><td>TLS</td><td>` + tlsInfo.Version + `</td></tr>
-        <tr><td>Cipher</td><td>` + tlsInfo.CipherSuite + `</td></tr>
-        <tr><td>Host</td><td>` + hostname + `</td></tr>
-        <tr><td>Remote</td><td>` + r.RemoteAddr + `</td></tr>
-        <tr><td>Time</td><td>` + time.Now().Format("2006-01-02 15:04:05") + `</td></tr>
-    </table>
-    <p>Endpoint: <code>/health</code></p>
+    <div class="container">
+        <h1>🔐 HTTPS Server</h1>
+        <p class="version">Version: ` + Version + ` | Build: ` + BuildDate + `</p>
+        
+        <div class="grid">
+            <div class="card">
+                <h2>📡 Connection</h2>
+                <table>
+                    <tr><td>Protocol</td><td>` + proto + `</td></tr>
+                    <tr><td>TLS Version</td><td>` + tlsInfo.Version + `</td></tr>
+                    <tr><td>Cipher Suite</td><td>` + tlsInfo.CipherSuite + `</td></tr>
+                    <tr><td>Server Host</td><td>` + hostname + `</td></tr>
+                    <tr><td>Your IP</td><td>` + realIP + `</td></tr>
+                    <tr><td>Remote Addr</td><td>` + r.RemoteAddr + `</td></tr>
+                    <tr><td>Server Time</td><td>` + time.Now().Format("2006-01-02 15:04:05 MST") + `</td></tr>
+                </table>
+            </div>
+            
+            <div class="card">
+                <h2>📊 Statistics</h2>
+                <div class="stats">
+                    <div class="stat-item">
+                        <div class="stat-value">` + fmt.Sprintf("%d", downloads) + `</div>
+                        <div class="stat-label">Downloads</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value">` + fmt.Sprintf("%.2f", float64(totalBytes)/(1<<20)) + `</div>
+                        <div class="stat-label">Total MB</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🔗 Endpoints</h2>
+                <ul class="endpoints">
+                    <li><code><a href="/health">/health</a></code><span class="method">GET</span><span class="desc">Health check</span></li>
+                    <li><code><a href="/stats">/stats</a></code><span class="method">GET</span><span class="desc">Download statistics</span></li>
+                    <li><code><a href="/download">/download</a></code><span class="method">GET</span><span class="desc">Speed test (size param)</span></li>
+                    <li><code>/generate_204</code><span class="method">GET</span><span class="desc">Captive portal check</span></li>
+                </ul>
+            </div>
+            
+            <div class="card">
+                <h2>📋 Request Headers</h2>
+                <div class="headers-list">
+                    <div class="header-item"><span class="header-key">User-Agent:</span> <span class="header-val">` + r.UserAgent() + `</span></div>
+                    <div class="header-item"><span class="header-key">Accept:</span> <span class="header-val">` + r.Header.Get("Accept") + `</span></div>
+                    <div class="header-item"><span class="header-key">Accept-Language:</span> <span class="header-val">` + r.Header.Get("Accept-Language") + `</span></div>
+                    <div class="header-item"><span class="header-key">Accept-Encoding:</span> <span class="header-val">` + r.Header.Get("Accept-Encoding") + `</span></div>
+                    <div class="header-item"><span class="header-key">Connection:</span> <span class="header-val">` + r.Header.Get("Connection") + `</span></div>
+                </div>
+            </div>
+        </div>
+        
+        <footer>
+            Powered by Go | TLS 1.3 Only | HTTP/2 & HTTP/3
+        </footer>
+    </div>
 </body>
 </html>`
 	_, _ = fmt.Fprint(w, html)
