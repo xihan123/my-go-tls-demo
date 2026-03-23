@@ -177,6 +177,43 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func getRealIP(r *http.Request) string {
+	singleIPHeaders := []string{
+		"CF-Connecting-IP",
+		"True-Client-IP",
+		"Ali-Cdn-Real-IP",
+		"Cdn-Real-IP",
+		"Cdn-Src-IP",
+		"X-Real-IP",
+		"Client-IP",
+		"X-Cluster-Client-IP",
+		"WL-Proxy-Client-IP",
+		"Proxy-Client-IP",
+	}
+
+	for _, h := range singleIPHeaders {
+		if ip := strings.TrimSpace(r.Header.Get(h)); ip != "" && net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+
+	for _, h := range []string{"X-Forwarded-For", "X-Forwarded", "Forwarded-For", "Forwarded"} {
+		if val := r.Header.Get(h); val != "" {
+			ips := strings.Split(val, ",")
+			for i := len(ips) - 1; i >= 0; i-- {
+				if ip := strings.TrimSpace(ips[i]); ip != "" && net.ParseIP(ip) != nil {
+					return ip
+				}
+			}
+		}
+	}
+
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 type SpeedTestManager struct {
 	downloadCnt atomic.Int64
 	totalBytes  atomic.Int64
@@ -408,7 +445,8 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 		if err := s.http3Server.SetQUICHeaders(w.Header()); err != nil {
 			log.Printf("SetQUICHeaders: %v", err)
 		}
-		log.Printf("[%s] %s %s %s", r.Method, r.URL.Path, r.RemoteAddr, r.Proto)
+		realIP := getRealIP(r)
+		log.Printf("[%s] %s %s (via %s) %s", r.Method, r.URL.Path, realIP, r.RemoteAddr, r.Proto)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -430,7 +468,8 @@ func (s *Server) speedTestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.speedTestMgr.isAllowed(r.RemoteAddr) {
+	realIP := getRealIP(r)
+	if !s.speedTestMgr.isAllowed(realIP) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
