@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0](https://github.com/xihan123/my-go-tls-demo/compare/v1.4.0...v1.5.0) (2026-04-03)
+
+
+### Features
+
+* **server:** 添加流量配额管理和HTTP服务器支持 ([fa54d1b](https://github.com/xihan123/my-go-tls-demo/commit/fa54d1b24dc5b761a01225b9fb5bb017b8cb11ed))
+
+
+### Miscellaneous
+
+* **go:** 更新 Go 版本到 1.26.1 ([6629b5e](https://github.com/xihan123/my-go-tls-demo/commit/6629b5e3d747143b825b893c33d969bf4348a7f6))
+* **workflow:** 更新发布工作流配置 ([f8e7e25](https://github.com/xihan123/my-go-tls-demo/commit/f8e7e258d04fd04137c610bbbe7573a35ceacbac))
+* **workflow:** 更新工作流配置以使用 main 分支 ([474dffd](https://github.com/xihan123/my-go-tls-demo/commit/474dffd5ab63e3a8d391b3e910371ff8f9f9f305))
+
 ## [1.4.0](https://github.com/xihan123/my-go-tls-demo/compare/v1.3.0...v1.4.0) (2026-03-23)
 
 
