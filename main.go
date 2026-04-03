@@ -2,18 +2,13 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -47,123 +42,10 @@ const (
 	writeTimeout         = 30 * time.Second
 	idleTimeout          = 120 * time.Second
 	maxHeaderBytes       = 1 << 20
-	certOrganization     = "Self-Signed Certificate"
-	certValidYears       = 10
-	rsaKeyBits           = 4096
 	defaultSpeedTestSize = 100 << 20
 	maxSpeedTestSize     = 1 << 30
+	defaultMaxTraffic    = int64(3) << 40 // 3TB
 )
-
-func generateSelfSignedCert(certPath, keyPath string) error {
-	certDir := filepath.Dir(certPath)
-	if err := os.MkdirAll(certDir, 0755); err != nil {
-		return fmt.Errorf("failed to create cert directory: %w", err)
-	}
-
-	keyDir := filepath.Dir(keyPath)
-	if keyDir != certDir {
-		if err := os.MkdirAll(keyDir, 0755); err != nil {
-			return fmt.Errorf("failed to create key directory: %w", err)
-		}
-	}
-
-	privateKey, err := rsa.GenerateKey(rand.Reader, rsaKeyBits)
-	if err != nil {
-		return fmt.Errorf("generate RSA key: %w", err)
-	}
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		return fmt.Errorf("generate serial number: %w", err)
-	}
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "localhost"
-	}
-
-	notBefore := time.Now()
-	notAfter := notBefore.AddDate(certValidYears, 0, 0)
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{certOrganization},
-			CommonName:   hostname,
-		},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost", hostname, "*.localhost"},
-		IPAddresses: []net.IP{
-			net.IPv4(127, 0, 0, 1),
-			net.IPv4(0, 0, 0, 0),
-			net.IPv6loopback,
-		},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		return fmt.Errorf("create certificate: %w", err)
-	}
-
-	certFile, err := os.Create(certPath)
-	if err != nil {
-		return fmt.Errorf("create cert file: %w", err)
-	}
-	defer func() {
-		if cerr := certFile.Close(); cerr != nil {
-			log.Printf("close cert file: %v", cerr)
-		}
-	}()
-
-	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
-		return fmt.Errorf("write cert: %w", err)
-	}
-
-	keyFile, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("create key file: %w", err)
-	}
-	defer func() {
-		if cerr := keyFile.Close(); cerr != nil {
-			log.Printf("close key file: %v", cerr)
-		}
-	}()
-
-	if err := pem.Encode(keyFile, &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-	}); err != nil {
-		return fmt.Errorf("write key: %w", err)
-	}
-
-	log.Printf("Generated self-signed certificate: %s", certPath)
-	log.Printf("Certificate valid from %s to %s", notBefore.Format(time.RFC3339), notAfter.Format(time.RFC3339))
-	log.Printf("Certificate includes: DNS=localhost,%s,*.localhost IP=127.0.0.1,0.0.0.0,::1", hostname)
-
-	return nil
-}
-
-func ensureCertExists(certPath, keyPath string) error {
-	if fileExists(certPath) && fileExists(keyPath) {
-		if _, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-			log.Printf("Using existing certificate: %s", certPath)
-			return nil
-		}
-		log.Printf("Existing certificate invalid, regenerating...")
-	}
-	log.Printf("Generating self-signed certificate...")
-	return generateSelfSignedCert(certPath, keyPath)
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
 
 func getRealIP(r *http.Request) string {
 	singleIPHeaders := []string{
@@ -203,15 +85,31 @@ func getRealIP(r *http.Request) string {
 }
 
 type SpeedTestManager struct {
-	downloadCnt atomic.Int64
-	totalBytes  atomic.Int64
-	whitelist   []*net.IPNet
-	allowAll    bool
+	downloadCnt  atomic.Int64
+	totalBytes   atomic.Int64
+	trafficQuota atomic.Int64 // remaining bytes, -1 = unlimited
+	whitelist    []*net.IPNet
+	allowAll     bool
+	statsFile    string
+	mu           sync.Mutex
 }
 
-func NewSpeedTestManager(whitelistStr string) *SpeedTestManager {
-	m := &SpeedTestManager{}
+func NewSpeedTestManager(whitelistStr, statsFile string, maxTraffic int64) *SpeedTestManager {
+	m := &SpeedTestManager{statsFile: statsFile}
 	m.parseWhitelist(whitelistStr)
+	m.loadStats()
+	if maxTraffic <= 0 {
+		m.trafficQuota.Store(-1)
+		log.Printf("Traffic quota: unlimited")
+	} else {
+		used := m.totalBytes.Load()
+		remain := maxTraffic - used
+		if remain < 0 {
+			remain = 0
+		}
+		m.trafficQuota.Store(remain)
+		log.Printf("Traffic quota: %.2f TB (used %.2f MB, limit %.2f TB)", float64(remain)/(1<<40), float64(used)/(1<<20), float64(maxTraffic)/(1<<40))
+	}
 	return m
 }
 
@@ -264,13 +162,74 @@ func (m *SpeedTestManager) isAllowed(ipStr string) bool {
 	return false
 }
 
-func (m *SpeedTestManager) recordDownload(bytes int64) {
-	m.downloadCnt.Add(1)
+func (m *SpeedTestManager) recordDownload(bytes int64, countDownload bool) {
+	if countDownload {
+		m.downloadCnt.Add(1)
+	}
 	m.totalBytes.Add(bytes)
+	m.saveStats()
 }
 
-func (m *SpeedTestManager) getStats() (downloads, totalBytes int64) {
-	return m.downloadCnt.Load(), m.totalBytes.Load()
+func (m *SpeedTestManager) tryReserve(n int64) bool {
+	for {
+		remain := m.trafficQuota.Load()
+		if remain < 0 {
+			return true
+		}
+		if remain < n {
+			log.Printf("Traffic quota exceeded: need %d, remain %d", n, remain)
+			return false
+		}
+		if m.trafficQuota.CompareAndSwap(remain, remain-n) {
+			log.Printf("Traffic reserved %d bytes, remain %d bytes", n, remain-n)
+			return true
+		}
+	}
+}
+
+func (m *SpeedTestManager) getStats() (downloads, totalBytes int64, quotaRemain int64) {
+	return m.downloadCnt.Load(), m.totalBytes.Load(), m.trafficQuota.Load()
+}
+
+type statsJSON struct {
+	Downloads  int64 `json:"downloads"`
+	TotalBytes int64 `json:"total_bytes"`
+}
+
+func (m *SpeedTestManager) loadStats() {
+	if m.statsFile == "" {
+		return
+	}
+	data, err := os.ReadFile(m.statsFile)
+	if err != nil {
+		return
+	}
+	var s statsJSON
+	if err := json.Unmarshal(data, &s); err != nil {
+		return
+	}
+	m.downloadCnt.Store(s.Downloads)
+	m.totalBytes.Store(s.TotalBytes)
+}
+
+func (m *SpeedTestManager) saveStats() {
+	if m.statsFile == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, err := json.Marshal(statsJSON{
+		Downloads:  m.downloadCnt.Load(),
+		TotalBytes: m.totalBytes.Load(),
+	})
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(m.statsFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	_ = os.WriteFile(m.statsFile, data, 0644)
 }
 
 func parseSizeParam(s string) (int64, error) {
@@ -282,6 +241,9 @@ func parseSizeParam(s string) (int64, error) {
 	var mult int64 = 1
 
 	switch {
+	case strings.HasSuffix(s, "TB"):
+		mult = 1 << 40
+		s = strings.TrimSuffix(s, "TB")
 	case strings.HasSuffix(s, "GB"):
 		mult = 1 << 30
 		s = strings.TrimSuffix(s, "GB")
@@ -303,21 +265,26 @@ func parseSizeParam(s string) (int64, error) {
 }
 
 type Server struct {
-	httpServer   *http.Server
-	http3Server  *http3.Server
-	tlsConfig    *tls.Config
-	certPath     string
-	keyPath      string
-	shutdownMu   sync.Mutex
-	shutdownCh   chan struct{}
-	speedTestMgr *SpeedTestManager
+	httpServer      *http.Server
+	http3Server     *http3.Server
+	httpPlainServer *http.Server
+	tlsConfig       *tls.Config
+	certPath        string
+	keyPath         string
+	shutdownMu      sync.Mutex
+	shutdownCh      chan struct{}
+	speedTestMgr    *SpeedTestManager
+	behindProxy     bool
 }
 
 type Config struct {
 	Addr           string
+	HTTPAddr       string
 	CertPath       string
 	KeyPath        string
 	SpeedWhitelist string
+	StatsFile      string
+	MaxTraffic     int64
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -334,15 +301,18 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("invalid key path: %w", err)
 	}
 
-	if err := ensureCertExists(certPath, keyPath); err != nil {
-		return nil, fmt.Errorf("ensure certificate: %w", err)
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		return nil, fmt.Errorf("load certificate: %w", err)
 	}
+	log.Printf("Using certificate: %s", certPath)
 
+	behindProxy := cfg.HTTPAddr != ""
 	s := &Server{
 		certPath:     certPath,
 		keyPath:      keyPath,
 		shutdownCh:   make(chan struct{}),
-		speedTestMgr: NewSpeedTestManager(cfg.SpeedWhitelist),
+		speedTestMgr: NewSpeedTestManager(cfg.SpeedWhitelist, cfg.StatsFile, cfg.MaxTraffic),
+		behindProxy:  behindProxy,
 	}
 
 	handler := s.createHandler()
@@ -388,6 +358,20 @@ func NewServer(cfg Config) (*Server, error) {
 		QUICConfig: &quic.Config{MaxIdleTimeout: idleTimeout},
 	}
 
+	if cfg.HTTPAddr != "" {
+		s.httpPlainServer = &http.Server{
+			Addr:              cfg.HTTPAddr,
+			Handler:           handler,
+			ReadTimeout:       readTimeout,
+			ReadHeaderTimeout: readHeaderTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    maxHeaderBytes,
+			ErrorLog:          log.New(os.Stderr, "HTTP: ", log.LstdFlags),
+		}
+		log.Printf("HTTP listener enabled on %s (Cloudflare Flexible mode)", cfg.HTTPAddr)
+	}
+
 	return s, nil
 }
 
@@ -422,7 +406,9 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Invalid path", http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+		if !s.behindProxy {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
@@ -472,15 +458,20 @@ func (s *Server) speedTestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.speedTestMgr.tryReserve(size) {
+		http.Error(w, "Traffic quota exceeded", http.StatusServiceUnavailable)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=test%dMB.bin", size>>20))
 
-	http.ServeContent(&statsWriter{
-		ResponseWriter: w,
-		onDone:         func(n int64) { s.speedTestMgr.recordDownload(n) },
-	}, r, "test.bin", time.Now(), &virtualReader{size: size})
+	sw := &statsWriter{ResponseWriter: w}
+	http.ServeContent(sw, r, "test.bin", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), &virtualReader{size: size})
+	isRange := r.Header.Get("Range") != ""
+	s.speedTestMgr.recordDownload(sw.n, !isRange)
 }
 
 var patternBlock [64 << 10]byte
@@ -542,8 +533,7 @@ func (v *virtualReader) Seek(offset int64, whence int) (int64, error) {
 
 type statsWriter struct {
 	http.ResponseWriter
-	onDone func(int64)
-	n      int64
+	n int64
 }
 
 func (w *statsWriter) Write(p []byte) (int, error) {
@@ -570,9 +560,13 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	downloads, total := s.speedTestMgr.getStats()
+	downloads, total, remain := s.speedTestMgr.getStats()
 	w.Header().Set("Content-Type", "application/json")
-	_, err := fmt.Fprintf(w, `{"downloads":%d,"total_bytes":%d,"total_mb":%.2f}`, downloads, total, float64(total)/(1<<20))
+	quotaStr := "unlimited"
+	if remain >= 0 {
+		quotaStr = fmt.Sprintf(`"%.2f"`, float64(remain)/(1<<40))
+	}
+	_, err := fmt.Fprintf(w, `{"downloads":%d,"total_bytes":%d,"total_mb":%.2f,"traffic_remaining_tb":%s}`, downloads, total, float64(total)/(1<<20), quotaStr)
 	if err != nil {
 		return
 	}
@@ -621,7 +615,7 @@ func (s *Server) defaultHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	realIP := getRealIP(r)
-	downloads, totalBytes := s.speedTestMgr.getStats()
+	_, used, remain := s.speedTestMgr.getStats()
 
 	html := `<!DOCTYPE html>
 <html>
@@ -663,8 +657,7 @@ code{background:#252525;padding:2px 6px;border-radius:4px;font-size:13px;color:#
 
 <div class="card">
 <h2>Stats</h2>
-<div class="row"><span class="key">Downloads</span><span class="val">` + fmt.Sprintf("%d", downloads) + `</span></div>
-<div class="row"><span class="key">Total</span><span class="val">` + fmt.Sprintf("%.2f MB", float64(totalBytes)/(1<<20)) + `</span></div>
+` + formatQuota(used, remain) + `
 </div>
 
 <div class="card">
@@ -709,6 +702,29 @@ func tlsCipherSuiteName(cipherSuite uint16) string {
 	}
 }
 
+func formatQuota(used, remain int64) string {
+	if remain < 0 {
+		usedStr := formatBytes(used)
+		return `<div class="row"><span class="key">Used</span><span class="val">` + usedStr + `</span></div>
+<div class="row"><span class="key">Quota</span><span class="val">Unlimited</span></div>`
+	}
+	return `<div class="row"><span class="key">Used</span><span class="val">` + formatBytes(used) + `</span></div>
+<div class="row"><span class="key">Quota</span><span class="val">` + formatBytes(remain) + `</span></div>`
+}
+
+func formatBytes(b int64) string {
+	switch {
+	case b >= 1<<40:
+		return fmt.Sprintf("%.2f TB", float64(b)/float64(1<<40))
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(1<<20))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
 func (s *Server) Start() error {
 	listener, err := net.Listen("tcp", s.httpServer.Addr)
 	if err != nil {
@@ -718,7 +734,7 @@ func (s *Server) Start() error {
 
 	log.Printf("HTTPS server on %s (HTTP/2 + HTTP/3)", s.httpServer.Addr)
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	go func() {
 		if err := s.httpServer.Serve(tlsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -731,6 +747,15 @@ func (s *Server) Start() error {
 			errCh <- fmt.Errorf("http3: %w", err)
 		}
 	}()
+
+	if s.httpPlainServer != nil {
+		go func() {
+			log.Printf("HTTP server on %s (Cloudflare Flexible mode)", s.httpPlainServer.Addr)
+			if err := s.httpPlainServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("http: %w", err)
+			}
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -748,6 +773,7 @@ func (s *Server) Shutdown() error {
 	s.shutdownMu.Lock()
 	defer s.shutdownMu.Unlock()
 	log.Println("Shutting down...")
+	s.speedTestMgr.saveStats()
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -758,6 +784,11 @@ func (s *Server) Shutdown() error {
 	}
 	if err := s.http3Server.Shutdown(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("http3: %w", err))
+	}
+	if s.httpPlainServer != nil {
+		if err := s.httpPlainServer.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("http: %w", err))
+		}
 	}
 
 	if len(errs) > 0 {
@@ -796,11 +827,23 @@ func main() {
 		speedWhitelist = whitelist
 	}
 
+	maxTraffic := defaultMaxTraffic
+	if v := os.Getenv("MAX_TRAFFIC"); v != "" {
+		if t, err := parseSizeParam(v); err == nil {
+			maxTraffic = t
+		} else {
+			log.Printf("invalid MAX_TRAFFIC: %v, using default 3TB", err)
+		}
+	}
+
 	cfg := Config{
 		Addr:           getEnvWithDefault("SERVER_ADDR", defaultAddr),
+		HTTPAddr:       getEnvWithDefault("HTTP_ADDR", ""),
 		CertPath:       getEnvWithDefault("CERT_PATH", "./certs/server.crt"),
 		KeyPath:        getEnvWithDefault("KEY_PATH", "./certs/server.key"),
 		SpeedWhitelist: speedWhitelist,
+		StatsFile:      getEnvWithDefault("STATS_FILE", "./data/stats.json"),
+		MaxTraffic:     maxTraffic,
 	}
 
 	server, err := NewServer(cfg)
