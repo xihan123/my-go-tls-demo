@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/joho/godotenv v1.5.1
-	github.com/quic-go/quic-go v0.59.0
+	github.com/quic-go/quic-go v0.59.1
 	golang.org/x/net v0.52.0
 )
 
